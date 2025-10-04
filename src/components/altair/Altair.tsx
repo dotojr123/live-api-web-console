@@ -23,7 +23,7 @@ import {
   Type,
 } from "@google/genai";
 
-const declaration: FunctionDeclaration = {
+const altairDeclaration: FunctionDeclaration = {
   name: "render_altair",
   description: "Displays an altair graph in json format.",
   parameters: {
@@ -36,6 +36,23 @@ const declaration: FunctionDeclaration = {
       },
     },
     required: ["json_graph"],
+  },
+};
+
+const chromeDevToolsDeclaration: FunctionDeclaration = {
+  name: "chrome-devtools",
+  description:
+    "Interacts with a web browser to perform tasks like searching, browsing, and extracting information from web pages. Use this tool for any requests that require accessing a website.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      instructions: {
+        type: Type.STRING,
+        description:
+          "A clear and concise instruction for the browser to execute. For example: 'Go to example.com and find the contact email.'",
+      },
+    },
+    required: ["instructions"],
   },
 };
 
@@ -53,46 +70,96 @@ function AltairComponent() {
       systemInstruction: {
         parts: [
           {
-            text: 'You are my helpful assistant. Any time I ask you for a graph call the "render_altair" function I have provided you. Dont ask for additional information just make your best judgement.',
+            text: 'You are a helpful assistant. You have two tools at your disposal: "render_altair" for creating graphs, and "chrome-devtools" for interacting with websites. Use "chrome-devtools" for any tasks involving web browsing or information retrieval from the internet. Use "render_altair" when asked to create a graph.',
           },
         ],
       },
       tools: [
-        // there is a free-tier quota for search
         { googleSearch: {} },
-        { functionDeclarations: [declaration] },
+        {
+          functionDeclarations: [altairDeclaration, chromeDevToolsDeclaration],
+        },
       ],
     });
   }, [setConfig, setModel]);
 
   useEffect(() => {
-    const onToolCall = (toolCall: LiveServerToolCall) => {
-      if (!toolCall.functionCalls) {
+    const onToolCall = async (toolCall: LiveServerToolCall) => {
+      if (!toolCall.functionCalls || toolCall.functionCalls.length === 0) {
         return;
       }
-      const fc = toolCall.functionCalls.find(
-        (fc) => fc.name === declaration.name
+
+      console.log("Received tool calls:", toolCall.functionCalls);
+
+      const responses = await Promise.all(
+        toolCall.functionCalls.map(async (fc) => {
+          let response: any;
+          try {
+            // Handle Altair graph rendering
+            if (fc.name === altairDeclaration.name) {
+              const str = (fc.args as any).json_graph;
+              setJSONString(str); // Update state for local rendering
+              response = { output: { success: true } }; // Simple success response
+            }
+            // Handle Chrome DevTools delegation
+            else if (fc.name === chromeDevToolsDeclaration.name) {
+              console.log(
+                `Delegating task to chrome-devtools:`,
+                fc.args
+              );
+              const apiResponse = await fetch(
+                "http://localhost:3001/execute-task",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    toolName: "chrome-devtools",
+                    params: fc.args,
+                  }),
+                }
+              );
+
+              if (!apiResponse.ok) {
+                const errorResult = await apiResponse.json();
+                throw new Error(
+                  `Task agent failed: ${errorResult.error || apiResponse.statusText}`
+                );
+              }
+
+              const result = await apiResponse.json();
+              response = { output: result }; // The result from the backend
+            }
+            // Handle unknown tools
+            else {
+              throw new Error(`Unknown tool call: ${fc.name}`);
+            }
+          } catch (e) {
+            const errorMessage =
+              e instanceof Error ? e.message : "An unknown error occurred";
+            console.error(
+              `Error processing tool call ${fc.name} (${fc.id}):`,
+              errorMessage
+            );
+            response = {
+              error: {
+                code: -1,
+                message: errorMessage,
+              },
+            };
+          }
+
+          return {
+            response,
+            id: fc.id,
+            name: fc.name,
+          };
+        })
       );
-      if (fc) {
-        const str = (fc.args as any).json_graph;
-        setJSONString(str);
-      }
-      // send data for the response of your tool call
-      // in this case Im just saying it was successful
-      if (toolCall.functionCalls.length) {
-        setTimeout(
-          () =>
-            client.sendToolResponse({
-              functionResponses: toolCall.functionCalls?.map((fc) => ({
-                response: { output: { success: true } },
-                id: fc.id,
-                name: fc.name,
-              })),
-            }),
-          200
-        );
-      }
+
+      console.log("Sending tool responses:", responses);
+      client.sendToolResponse({ functionResponses: responses });
     };
+
     client.on("toolcall", onToolCall);
     return () => {
       client.off("toolcall", onToolCall);
